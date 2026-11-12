@@ -44,11 +44,14 @@ without sending it.
 
 ## Chains
 
-Any chain V1.0 keeps (installed on that arcade, not borrowed): `peptest`, `pep`, `doge`, `ltc`, `ltctest`,
-`dgb`, `dgbtest`, `kot`, `flop`, `wjk`, `bel`, `lky`, `btc`, `shic`, `jkc`.
+Any chain V1.0 keeps or borrows: `peptest`, `pep`, `doge`, `ltc`, `ltctest`, `dgb`, `dgbtest`, `kot`, `flop`,
+`wjk`, `bel`, `lky`, `btc`, `shic`, `jkc`. Borrowed chains (not installed on that arcade, or still syncing)
+need an Arcade V1.0 with borrowed-chain RPC (arcade-v1 PR #94): coins then come from a lender's address
+index, each checked against its block, and transactions go out through the lenders.
 
 - Addresses are legacy P2PKH, with each chain's own version byte (the same key gives a different address per chain).
-- The fee rate and dust limit are V1.0's own for that chain (`tx.fee`), so a transaction is priced as V1.0 prices its own.
+- The fee rate and dust limit come from V1.0 (`tx.fee`). From arcade-v1 PR #94 on they are V1.0's own wallet's for
+  that chain; older V1.0 builds give one rate for every chain.
 - Small bodies go in an OP_RETURN (Class C); bigger ones use the Class B marker and bare-multisig outputs, 0.01 coin
   each, as V1.0 builds them. On a chain whose coin is worth a lot (Bitcoin) that value adds up: check
   `--whoami` and start small.

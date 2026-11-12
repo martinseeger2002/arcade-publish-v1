@@ -342,6 +342,28 @@ class Publisher:
         self.coins.note(unsigned, txid)
         return txid
 
+    def _known(self, journal: "Journal", slot: str) -> str:
+        """The transaction noted for `slot` before it was broadcast, when the chain knows it (in a block
+        or waiting): a run stopped between the broadcast and the journal entry finds it here and sends
+        nothing again. Asked by its own txid, so it works where no wallet history can be listed (a
+        chain Arcade V1.0 borrows)."""
+        prior = journal.data.get("sending", {}).get(slot, "")
+        if prior and self._confirmations(prior) is not None:
+            self.say(f"{slot}: already sent as {prior}")
+            return prior
+        return ""
+
+    def _send_noted(self, journal: "Journal", slot: str, unsigned: funding.Unsigned) -> str:
+        """Sign, note the txid in the journal, then broadcast (the txid is known before anything goes out)."""
+        sigs = [self.key.sign(bytes.fromhex(h)).hex() for h in unsigned.sighashes]
+        raw = funding.assemble(unsigned, sigs, self.key.pubkey)
+        txid = _txid_of(raw)
+        journal.data.setdefault("sending", {})[slot] = txid
+        journal.save()
+        self.rpc.call("sendrawtransaction", raw)
+        self.coins.note(unsigned, txid)
+        return txid
+
     def _confirmations(self, txid: str) -> int | None:
         """How deep a transaction is, None if the node has no record of it."""
         try:
@@ -397,9 +419,11 @@ class Publisher:
 
         self.coins.watch()
         if plan.chunks == 1:
-            outputs = payload_outputs(self.params, self.address, self.key.pubkey, plan.payloads[0])
-            unsigned = build(self.params, self.address, self.coins.unspent(), outputs, self.rate, f"inscribe {name or kind}")
-            txid = self._send(unsigned)
+            txid = self._known(journal, "single")
+            if not txid:
+                outputs = payload_outputs(self.params, self.address, self.key.pubkey, plan.payloads[0])
+                unsigned = build(self.params, self.address, self.coins.unspent(), outputs, self.rate, f"inscribe {name or kind}")
+                txid = self._send_noted(journal, "single", unsigned)
             journal.data["txids"] = [txid]
             journal.save()
             self.say(f"inscribed {name or kind}: {txid}")
@@ -407,10 +431,13 @@ class Publisher:
 
         piece = inscribelib.piece_size(plan)
         if not journal.data["split"] or self._confirmations(journal.data["split"]) is None:
-            split = build(self.params, self.address, self.coins.unspent(),
-                          [(piece, p2pkh_script(self.address))] * plan.chunks, self.rate,
-                          f"split into {plan.chunks} outputs, to inscribe {name or kind}")
-            journal.data["split"] = self._send(split)
+            known = self._known(journal, "split")
+            if not known:
+                split = build(self.params, self.address, self.coins.unspent(),
+                              [(piece, p2pkh_script(self.address))] * plan.chunks, self.rate,
+                              f"split into {plan.chunks} outputs, to inscribe {name or kind}")
+                known = self._send_noted(journal, "split", split)
+            journal.data["split"] = known
             journal.data["pieces"] = {}
             journal.save()
             self.say(f"split {name or kind} into {plan.chunks} pieces: {journal.data['split']}")
@@ -418,6 +445,12 @@ class Publisher:
 
         for n, body in enumerate(plan.payloads):
             if str(n) in journal.data["pieces"]:
+                continue
+            slot = f"piece {n} of {journal.data['split']}"
+            known = self._known(journal, slot)
+            if known:
+                journal.data["pieces"][str(n)] = known
+                journal.save()
                 continue
             coin = {"txid": journal.data["split"], "vout": n, "value": piece, "address": self.address}
             outputs = payload_outputs(self.params, self.address, self.key.pubkey, body)
@@ -428,7 +461,7 @@ class Publisher:
             else:
                 unsigned = funding.build_one(self.params, self.address, coin, outputs, self.rate, what)
             try:
-                txid = self._send(unsigned)
+                txid = self._send_noted(journal, slot, unsigned)
             except RpcError as exc:
                 # The output is already spent: this piece went out in a run whose
                 # journal entry never got written. Find it rather than pay again --

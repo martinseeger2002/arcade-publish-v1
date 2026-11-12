@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arcade-publish"
+version = "0.1.0"
+description = "Inscribe files and make transfers with your own key, through Arcade V1.0, on any chain it keeps"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["cryptography>=41", "requests>=2.28", "pynacl>=1.5"]
+
+[project.scripts]
+arcade-publish = "v1publish.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["arcade*", "v1publish*"]

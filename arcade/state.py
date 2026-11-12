@@ -1,0 +1,1902 @@
+"""Protocol state: properties, balances, and the transaction logic over them.
+
+Two kinds of failure are carefully distinguished here, because conflating them is
+how meta-layers silently diverge:
+
+  * **Unsupported message type** -> raise, and stop the indexer. We do not know
+    what the rest of the network did with it, so any state we produce afterwards
+    is untrustworthy. (Hard rule #2.)
+
+  * **Invalid transaction** -> record it as invalid and change NO state. This is
+    normal and expected: an underfunded send, a bad property id, a missing
+    recipient. Every implementation must agree these do nothing, so they are part
+    of consensus, not errors.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from . import inscriptions as I
+from . import tags as T
+from . import payload as P
+from .config import (
+    FIRST_PROPERTY_ID_MAIN,
+    FIRST_PROPERTY_ID_TEST,
+    RESERVED_PROPERTY_IDS,
+    Params,
+)
+from .db import (Database, StateDB, add_missing_columns,
+                 register_journalled_table)
+from .tx import ArcadeTransaction, EncodingClass
+
+# Omni's MAX_INT_8_BYTES -- amounts are signed 64-bit on the wire despite being
+# carried in a uint64 field.
+MAX_AMOUNT = 9_223_372_036_854_775_807
+
+ECOSYSTEM_MAIN = 1
+ECOSYSTEM_TEST = 2
+
+# Property types (omnicore.h:89-95).
+PROPERTY_INDIVISIBLE = 1
+PROPERTY_DIVISIBLE = 2
+PROPERTY_NONFUNGIBLE = 5
+FUNGIBLE_PROPERTY_TYPES = frozenset({1, 2, 65, 66, 129, 130})
+ALL_PROPERTY_TYPES = FUNGIBLE_PROPERTY_TYPES | {PROPERTY_NONFUNGIBLE}
+
+
+SCHEMA = """
+-- One row per created property.
+CREATE TABLE IF NOT EXISTS property (
+    property_id     INTEGER PRIMARY KEY,
+    ecosystem       INTEGER NOT NULL,
+    property_type   INTEGER NOT NULL,
+    issuer          TEXT    NOT NULL,
+    category        TEXT    NOT NULL DEFAULT '',
+    subcategory     TEXT    NOT NULL DEFAULT '',
+    name            TEXT    NOT NULL DEFAULT '',
+    url             TEXT    NOT NULL DEFAULT '',
+    data            TEXT    NOT NULL DEFAULT '',
+    managed         INTEGER NOT NULL DEFAULT 0,
+    total_tokens    INTEGER NOT NULL DEFAULT 0,
+    creation_txid   TEXT    NOT NULL,
+    creation_block  INTEGER NOT NULL
+);
+
+-- Balance buckets, mirroring Omni's TallyType (tally.h:8-15).
+-- PENDING is deliberately absent: it is a wallet-side concept and is excluded
+-- from the consensus hash (consensushash.cpp:49-58).
+CREATE TABLE IF NOT EXISTS balance (
+    address            TEXT    NOT NULL,
+    property_id        INTEGER NOT NULL,
+    balance            INTEGER NOT NULL DEFAULT 0,
+    selloffer_reserve  INTEGER NOT NULL DEFAULT 0,
+    accept_reserve     INTEGER NOT NULL DEFAULT 0,
+    metadex_reserve    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (address, property_id)
+);
+
+-- Feature activations received on-chain (types 65533/65534).
+CREATE TABLE IF NOT EXISTS activation (
+    feature_id         INTEGER PRIMARY KEY,
+    activation_block   INTEGER NOT NULL,
+    min_client_version INTEGER NOT NULL,
+    active             INTEGER NOT NULL DEFAULT 1
+);
+
+-- Every protocol-carrying transaction seen, valid or not. Invalid ones are kept
+-- deliberately: "this did nothing, and here is why" is consensus-relevant and
+-- the first thing anyone asks when two implementations disagree.
+CREATE TABLE IF NOT EXISTS arcade_tx (
+    txid           TEXT    PRIMARY KEY,
+    block_height   INTEGER NOT NULL,
+    position       INTEGER NOT NULL,
+    encoding_class TEXT    NOT NULL,
+    message_type   INTEGER,
+    message_version INTEGER,
+    sender         TEXT    NOT NULL,
+    reference      TEXT,
+    payload_hex    TEXT    NOT NULL,
+    valid          INTEGER NOT NULL,
+    invalid_reason TEXT
+);
+
+-- Inscriptions. A file written onto the chain in full, owned by an address and
+-- moved only by its owner saying so.
+--
+-- `number` is assigned in chain order when the LAST piece arrives, which is the
+-- moment the inscription exists. Two nodes replaying the same chain therefore
+-- agree without having to talk to each other: the order is the chain's, not
+-- anybody's opinion.
+--
+-- `content` may be NULL. The hash and the length are always kept, so a body
+-- that was not stored can be fetched back off the chain and proved to be the
+-- right one -- which is what lets a node keep its own inscriptions in full
+-- without also keeping every megabyte a stranger ever wrote.
+CREATE TABLE IF NOT EXISTS inscription (
+    txid          TEXT    PRIMARY KEY,
+    number        INTEGER NOT NULL,
+    creator       TEXT    NOT NULL,
+    owner         TEXT    NOT NULL,
+    block_height  INTEGER NOT NULL,
+    position      INTEGER NOT NULL,
+    content_type  TEXT    NOT NULL,
+    content_len   INTEGER NOT NULL,
+    sha256        TEXT    NOT NULL,
+    json          TEXT    NOT NULL DEFAULT '',
+    chunks        INTEGER NOT NULL,
+    content       BLOB
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS inscription_number_idx ON inscription(number);
+CREATE INDEX IF NOT EXISTS inscription_owner_idx ON inscription(owner);
+CREATE INDEX IF NOT EXISTS inscription_creator_idx ON inscription(creator);
+
+-- Pieces seen so far, keyed by who sent them as well as by the id in the
+-- payload. The id is in the clear on the chain, so anyone can publish a chunk
+-- claiming somebody else's -- grouping by sender is what stops one injected
+-- piece making a real inscription permanently incomplete.
+CREATE TABLE IF NOT EXISTS inscription_chunk (
+    sender        TEXT    NOT NULL,
+    inscription_id TEXT   NOT NULL,
+    countdown     INTEGER NOT NULL,
+    txid          TEXT    NOT NULL,
+    block_height  INTEGER NOT NULL,
+    position      INTEGER NOT NULL,
+    body          BLOB    NOT NULL,
+    PRIMARY KEY (sender, inscription_id, countdown)
+);
+
+-- Which transactions an assembled inscription was made of, in the order its
+-- countdown gives them. Kept so the FILE does not have to be: the bytes are
+-- on the chain in full, this says where, and `ledger.inscription_content`
+-- reads them back and checks them against the manifest's sha256 when
+-- somebody actually asks for them (D-113).
+CREATE TABLE IF NOT EXISTS inscription_piece (
+    inscription  TEXT    NOT NULL,
+    countdown    INTEGER NOT NULL,
+    txid         TEXT    NOT NULL,
+    PRIMARY KEY (inscription, countdown)
+);
+
+-- Collections. Which set an inscription belongs to, read off its JSON by one
+-- rule (`inscriptions.collection_of`) at the moment it completes, so every
+-- node files it the same way. A set from the HashLips Art Engine lands here
+-- with no extra work: its metadata already says `name: "Prefix #12"` and
+-- `edition: 12`, and that is the rule.
+CREATE TABLE IF NOT EXISTS collection_item (
+    txid          TEXT    PRIMARY KEY,
+    creator       TEXT    NOT NULL,
+    collection    TEXT    NOT NULL,
+    edition       INTEGER,
+    name          TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS collection_item_idx
+    ON collection_item(creator, collection, edition);
+
+-- @tags. One name to an address and one address to a name: a name that points
+-- at two people is not a name, and an address with two gives a reader two
+-- answers to the same question. Both are enforced by the keys here rather than
+-- by the code that writes them.
+CREATE TABLE IF NOT EXISTS tag (
+    tag           TEXT    PRIMARY KEY,
+    address       TEXT    NOT NULL UNIQUE,
+    claimed_txid  TEXT    NOT NULL,
+    block_height  INTEGER NOT NULL,
+    position      INTEGER NOT NULL
+);
+
+-- The order book. An order is a standing, public instruction: this address
+-- will sell (or buy) this much of a token at this price, until it is
+-- cancelled or it can no longer be honoured. Price is a pair of integers and
+-- is never a float: amount_desired / amount_for_sale, exact (D-048).
+--
+-- Property 0 is the chain's own coin. Omni has no such id, because Omni's
+-- MetaDEx pairs two tokens and leaves the native coin to its older DEx; here
+-- the coin is one side of every pair, so it needs a name.
+-- A take (type 29) as a trade: the token amount it moved and the coins it paid
+-- the maker, written when the engine applies it. The swap path's trades are
+-- read back out of their own payloads (ledger.trades); a take's payload names
+-- only the order and the amount, so the price is written down here or it is
+-- lost with the order (a tester, 2026-09-27: Buy fills never reached the chart).
+CREATE TABLE IF NOT EXISTS take_trade (
+    txid          TEXT    PRIMARY KEY,
+    property_id   INTEGER NOT NULL,
+    tokens        INTEGER NOT NULL,
+    coins         INTEGER NOT NULL,
+    maker         TEXT    NOT NULL
+);
+
+-- The swaps found in arcade_tx (ledger.trades, 2026-11-05: the Exchange's token tab read every type-200 payload --
+-- 363 MB on Pepecoin testnet, minutes on a laptop disk -- to find 33 swaps). Only txids: a swap's legs are read back
+-- from its own payload, and a row dropped by a reorg leaves arcade_tx, so the join drops it too. `trade_scan` holds how
+-- far arcade_tx has been read for them (k "rowid"); each read looks at newer rows and the last few blocks only.
+CREATE TABLE IF NOT EXISTS trade_seen (
+    txid          TEXT    PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS trade_scan (
+    k             TEXT    PRIMARY KEY,
+    v             INTEGER NOT NULL
+);
+
+-- A match between two token/token orders (Params.token_pairs_from): the
+-- taker's order (txid) met a resting one (maker_txid). `gave` of property
+-- `gave_property` went from taker to maker and `got` of `got_property` came
+-- back, at the maker's price. One row per resting order it met, in order.
+CREATE TABLE IF NOT EXISTS pair_trade (
+    txid          TEXT    NOT NULL,
+    seq           INTEGER NOT NULL,
+    block_height  INTEGER NOT NULL,
+    position      INTEGER NOT NULL,
+    taker         TEXT    NOT NULL,
+    maker         TEXT    NOT NULL,
+    maker_txid    TEXT    NOT NULL,
+    gave_property INTEGER NOT NULL,
+    gave          INTEGER NOT NULL,
+    got_property  INTEGER NOT NULL,
+    got           INTEGER NOT NULL,
+    PRIMARY KEY (txid, seq)
+);
+
+CREATE TABLE IF NOT EXISTS book_order (
+    txid          TEXT    PRIMARY KEY,
+    block_height  INTEGER NOT NULL,
+    position      INTEGER NOT NULL,
+    address       TEXT    NOT NULL,
+    sale_property INTEGER NOT NULL,
+    sale_amount   INTEGER NOT NULL,     -- what is left of it
+    want_property INTEGER NOT NULL,
+    want_amount   INTEGER NOT NULL,     -- for what is left, at the same price
+    reserved      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS book_order_pair_idx
+    ON book_order(sale_property, want_property);
+
+-- Where an inscription has been. One row per hand it changed in, written as
+-- the move is applied, because the inscription row itself only ever holds the
+-- CURRENT owner -- it is overwritten on every transfer, so indexed state kept
+-- no history at all and "when did this first leave the creator" had no answer
+-- on any node (D-071).
+--
+-- Not the same thing as the transaction list: a page asking for provenance
+-- wants who held it and when, not which transactions carried the bytes.
+CREATE TABLE IF NOT EXISTS inscription_move (
+    -- Keyed on the pair, not the transaction. One swap can hand over TWO
+    -- pieces -- a Goofball for a Goofball is the trade this was built to
+    -- make possible -- and `_move_leg` is then called twice for one txid.
+    -- Keyed on txid alone the second insert collided, and it raised
+    -- StateError rather than InvalidTransaction, so it threw out of the
+    -- handler instead of marking the transaction invalid: one such swap on
+    -- the chain would have stopped indexing at that height on every node
+    -- that met it (D-080).
+    txid          TEXT    NOT NULL,
+    inscription   TEXT    NOT NULL,
+    from_address  TEXT    NOT NULL,
+    to_address    TEXT    NOT NULL,
+    block_height  INTEGER NOT NULL,
+    position      INTEGER NOT NULL,
+    how           TEXT    NOT NULL DEFAULT 'transfer',  -- or 'swap'
+    PRIMARY KEY (txid, inscription)
+);
+CREATE INDEX IF NOT EXISTS inscription_move_item
+    ON inscription_move(inscription, block_height, position);
+
+-- An offer for somebody's inscription, made in public (D-042). Said on the
+-- chain because a holder who never published a key cannot be messaged, and
+-- never asked to be. Nothing is locked by one: it is an offer.
+CREATE TABLE IF NOT EXISTS nft_offer (
+    txid          TEXT    PRIMARY KEY,
+    block_height  INTEGER NOT NULL,
+    position      INTEGER NOT NULL,
+    inscription   TEXT    NOT NULL,
+    buyer         TEXT    NOT NULL,
+    take_kind     INTEGER NOT NULL,
+    take_property INTEGER,
+    take_amount   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nft_offer_item_idx ON nft_offer(inscription);
+
+-- The other half: a price put on an inscription by whoever holds it (D-099).
+-- An Omni-style ask, in the sense that matters -- it is a standing public
+-- instruction, indexed from the chain, that anybody can read and act on --
+-- but it reserves nothing. Nothing on this chain can hold an inscription
+-- back, and an ask is live only while the address that made it still holds
+-- what it names, so sending a piece away withdraws its price with no
+-- transaction at all. One row per ask transaction; the newest for an
+-- inscription is the one that counts, and a take_kind of 0 is a withdrawal.
+CREATE TABLE IF NOT EXISTS nft_ask (
+    txid          TEXT    PRIMARY KEY,
+    block_height  INTEGER NOT NULL,
+    position      INTEGER NOT NULL,
+    inscription   TEXT    NOT NULL,
+    seller        TEXT    NOT NULL,
+    take_kind     INTEGER NOT NULL,
+    take_property INTEGER,
+    take_amount   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nft_ask_item_idx ON nft_ask(inscription, block_height, position);
+
+CREATE INDEX IF NOT EXISTS ribbit_tx_block_idx ON arcade_tx(block_height, position);
+CREATE INDEX IF NOT EXISTS balance_property_idx ON balance(property_id);
+"""
+
+
+def install_schema(db: Database) -> None:
+    """Create the protocol tables and register them for journalling."""
+    db.conn.executescript(SCHEMA)
+    add_missing_columns(db.conn, SCHEMA)
+    register_journalled_table("property", ("property_id",))
+    register_journalled_table("balance", ("address", "property_id"))
+    register_journalled_table("activation", ("feature_id",))
+    register_journalled_table("arcade_tx", ("txid",))
+    register_journalled_table("tag", ("tag",))
+    register_journalled_table("inscription", ("txid",))
+    register_journalled_table("nft_offer", ("txid",))
+    register_journalled_table("nft_ask", ("txid",))
+    register_journalled_table("inscription_move", ("txid", "inscription"))
+    register_journalled_table("take_trade", ("txid",))
+    register_journalled_table("pair_trade", ("txid", "seq"))
+    register_journalled_table("book_order", ("txid",))
+    register_journalled_table("inscription_chunk",
+                              ("sender", "inscription_id", "countdown"))
+    register_journalled_table("collection_item", ("txid",))
+    register_journalled_table("inscription_piece", ("inscription", "countdown"))
+    # Coins by address, for addresses this node does not own. Installed
+    # here so it is journalled with everything else: a reorg that takes a
+    # block back has to un-spend what that block spent (arcade/utxos.py).
+    from . import utxos
+    utxos.install(db)
+    # The block ranges each watched address's coins are complete over, beyond watching (arcade/coinlist.py).
+    from . import coinlist
+    coinlist.install(db)
+    # DigiDollar coins of the accounts that opened DigiDollar (arcade/digidollar.py): journalled like the coins.
+    from . import digidollar
+    digidollar.install(db)
+    _rekey_moves(db)
+    _file_collections(db)
+
+
+def _rekey_moves(db: Database) -> None:
+    """Replace an inscription_move keyed on txid alone.
+
+    Shipped that way and it cannot record a swap of two pieces. Dropped
+    rather than migrated because every row is derived from transactions this
+    node has already read: the backfill rebuilds the lot, and a rebuild from
+    the source beats a rewrite of a table that was wrong (D-080).
+    """
+    row = db.conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='inscription_move'"
+    ).fetchone()
+    if row and "PRIMARY KEY (txid, inscription)" not in (row["sql"] or ""):
+        db.conn.execute("DROP TABLE inscription_move")
+        db.conn.executescript(SCHEMA)
+
+
+def joins_collection(conn, creator: str, collection: str,
+                     edition: int | None, name: str) -> bool:
+    """Whether a finished inscription takes its place in the set it names.
+
+    A set is (creator, collection), so nobody else's inscription can land in
+    yours whatever its JSON says: another address inscribing "Pixel Skulls
+    #7" opens a set of their own under their own key, and the page, the floor
+    and the mintpad are all keyed the same way. That half was always true.
+    Two rules seal the other half (D-120):
+
+      * one piece per edition. A build inscribed twice filed a second
+        #1..#100 beside the first and the set came out doubled -- every piece
+        present in duplicate, a hundred items reading as two hundred.
+      * the #1 may declare a `supply`, and once the set holds that many,
+        nothing further joins it. The wizard now writes one on every set it
+        inscribes, so a set says how big it is in the same breath as what it
+        is called.
+
+    A refused piece is still an inscription. It was paid for, it is on the
+    chain, its owner holds it and can sell it -- it is simply not a member of
+    that set, which is the only thing a second copy could honestly be.
+    """
+    if edition is not None:
+        already = conn.execute(
+            "SELECT 1 FROM collection_item "
+            "WHERE creator = ? AND collection = ? AND edition = ?",
+            (creator, collection, edition)).fetchone()
+    else:
+        # A set numbered by nothing but its names: the name is the edition.
+        already = conn.execute(
+            "SELECT 1 FROM collection_item WHERE creator = ? AND collection = ? "
+            "AND edition IS NULL AND name = ?",
+            (creator, collection, name)).fetchone()
+    if already is not None:
+        return False
+    supply = _declared_supply(conn, creator, collection)
+    if not supply:
+        return True
+    if edition is not None and edition > supply:
+        return False
+    held = conn.execute(
+        "SELECT COUNT(*) AS n FROM collection_item WHERE creator = ? AND collection = ?",
+        (creator, collection)).fetchone()["n"]
+    return held < supply
+
+
+def _declared_supply(conn, creator: str, collection: str) -> int:
+    """How many pieces the set's own #1 says there are, or 0 for unsaid.
+
+    Read from the #1 rather than from a separate manifest because a set has
+    no object on this chain to hold one: the piece a collection is known by
+    is where it says everything else about itself already (D-097), and a
+    number written there is on the chain before item two is paid for.
+    """
+    row = conn.execute(
+        "SELECT i.json AS json FROM collection_item c "
+        "JOIN inscription i ON i.txid = c.txid "
+        "WHERE c.creator = ? AND c.collection = ? AND c.edition = 1",
+        (creator, collection)).fetchone()
+    if row is None:
+        return 0
+    said = I.collection_details(row["json"]).get("supply")
+    return said if isinstance(said, int) and said > 0 else 0
+
+
+#: What a token name may be written with: ordinary printable ASCII. Anything
+#: else is refused rather than folded away, because folding is what lets a
+#: character vanish from the comparison and stay on the screen (D-122).
+NAME_CHARACTERS = frozenset(chr(n) for n in range(0x20, 0x7F))
+
+
+def name_key(name: str) -> str:
+    """The form two token names are compared in: letters and digits, folded.
+
+    "Dogecoin Arcade", "dogecoin arcade", "Dogecoin-Arcade" and
+    "DOGECOINARCADE" are one name to everybody who reads them, so they are
+    one name here. Everything else -- spaces, punctuation, case -- is how a
+    name is written rather than which name it is, and leaving any of it in
+    means the rule can be stepped around by pressing the space bar (D-122).
+
+    Only meaningful for a name `name_complaint` accepts: it is ASCII by then,
+    so there is no character in it that this can silently drop.
+    """
+    return "".join(ch for ch in (name or "").lower() if "a" <= ch <= "z" or ch.isdigit())
+
+
+def name_complaint(name: str) -> str:
+    """Why this cannot be a token name at all, or "" if it can.
+
+    Separate from the uniqueness rule, and asked first, because "what may a
+    name contain" and "is this name taken" are different questions and only
+    the first one can be answered about a name on its own.
+
+    Refusing rather than folding is the whole point. A fold deletes what it
+    does not recognise, and a character that disappears from the comparison
+    while staying on every screen is exactly the hole this rule exists to
+    close: "Dogecoin" with a Cyrillic o renders identically to "Dogecoin" in
+    every page either machine draws, and would be a different token. Folded,
+    it passes whichever way the fold is written -- dropped, and it makes a
+    new key; kept, and it makes a new key. Refused, it cannot (a test machine found
+    this before the rule reached the chain).
+
+    So a name is printable ASCII, and the door to more than that is a later
+    decision with its own activation height and its own confusables policy,
+    not a side effect of how a key is built. No mainnet token exists yet, so
+    nothing on any chain is rewritten by saying it now.
+    """
+    said = (name or "").strip()
+    if not said:
+        return "a token name must not be empty."
+    odd = [ch for ch in said if ch not in NAME_CHARACTERS]
+    if odd:
+        return (f"a token name uses ordinary letters, digits and punctuation "
+                f"-- {odd[0]!r} is not one of them. Characters from other "
+                f"alphabets can look identical to these on a page, and a name "
+                f"that looks like another token's is the one thing a name "
+                f"must not do.")
+    if not name_key(said):
+        return "a token name needs at least one letter or digit."
+    return ""
+
+
+def _file_collections(db: Database) -> None:
+    """File inscriptions indexed before collections were, once.
+
+    The rule is a pure function of the JSON already in the row, so an index
+    built by an older version is brought level here rather than by a rescan.
+    Nothing is journalled: these rows are as old as the inscriptions they
+    describe, and a reorg deep enough to remove those removes the whole
+    index's recent history anyway.
+    """
+    rows = db.conn.execute(
+        "SELECT i.txid, i.creator, i.json FROM inscription i "
+        "LEFT JOIN collection_item c ON c.txid = i.txid "
+        "WHERE c.txid IS NULL AND i.json != '' ORDER BY i.number").fetchall()
+    for row in rows:
+        member = I.collection_of(row["json"])
+        if member is None:
+            continue
+        collection, edition, name = member
+        # In chain order and through the same gate the engine uses, so an
+        # index brought level here holds the same set as one built from the
+        # blocks: first claim wins there, first claim wins here.
+        if not joins_collection(db.conn, row["creator"], collection, edition, name):
+            continue
+        db.conn.execute(
+            "INSERT OR IGNORE INTO collection_item "
+            "(txid, creator, collection, edition, name) VALUES (?, ?, ?, ?, ?)",
+            (row["txid"], row["creator"], collection, edition, name))
+
+
+class InvalidTransaction(Exception):
+    """The transaction is well-formed but breaks a protocol rule.
+
+    This is a normal outcome, not a bug. It is caught by the engine, recorded,
+    and changes no state.
+    """
+
+
+@dataclass
+class Result:
+    """What processing one transaction did."""
+
+    valid: bool
+    reason: str | None = None
+    message_type: int | None = None
+    message_version: int | None = None
+
+
+class Engine:
+    """Applies Arcade messages to protocol state."""
+
+    def __init__(self, state: StateDB, params: Params,
+                 keep_content: Callable[[str], bool] | None = None,
+                 names_only: bool = False):
+        self.state = state
+        self.params = params
+        #: A block below the floor, read for its @names and nothing else
+        #: (config.Params.names_from): a tag claim or transfer is applied as
+        #: anywhere, every other transaction is passed over unrecorded.
+        self.names_only = names_only
+        # Whether an inscription's bytes are worth keeping, asked of its
+        # creator's address. A node keeps its own in full and describes
+        # everybody else's -- the hash and the length are always stored, so a
+        # body that was not kept can be fetched back off the chain later and
+        # proved to be the right one.
+        # Nothing kept by default: the bytes are on the chain, the pieces
+        # table says where, and they are read back when somebody asks
+        # (D-113). A node that would rather hold them -- a gallery answering
+        # strangers, an archive -- passes its own policy here.
+        self.keep_content = keep_content or (lambda address: False)
+
+    # --- balance helpers ------------------------------------------------------
+
+    def get_balance(self, address: str, property_id: int) -> dict[str, int]:
+        row = self.state.db.conn.execute(
+            "SELECT * FROM balance WHERE address = ? AND property_id = ?",
+            (address, property_id),
+        ).fetchone()
+        if row is None:
+            return {
+                "balance": 0,
+                "selloffer_reserve": 0,
+                "accept_reserve": 0,
+                "metadex_reserve": 0,
+            }
+        return {
+            "balance": row["balance"],
+            "selloffer_reserve": row["selloffer_reserve"],
+            "accept_reserve": row["accept_reserve"],
+            "metadex_reserve": row["metadex_reserve"],
+        }
+
+    def credit(self, address: str, property_id: int, amount: int, bucket: str = "balance") -> None:
+        if amount == 0:
+            return
+        current = self.get_balance(address, property_id)
+        exists = self.state.db.conn.execute(
+            "SELECT 1 FROM balance WHERE address = ? AND property_id = ?", (address, property_id)
+        ).fetchone()
+        new_value = current[bucket] + amount
+        if new_value < 0:
+            raise InvalidTransaction(
+                f"{bucket} for {address} property {property_id} would go negative"
+            )
+        if exists:
+            self.state.update(
+                "balance", {"address": address, "property_id": property_id}, {bucket: new_value}
+            )
+        else:
+            row = {"address": address, "property_id": property_id, **current}
+            row[bucket] = new_value
+            self.state.insert("balance", row)
+
+    def debit(self, address: str, property_id: int, amount: int, bucket: str = "balance") -> None:
+        self.credit(address, property_id, -amount, bucket)
+
+    # --- property helpers -----------------------------------------------------
+
+    def get_property(self, property_id: int) -> Any:
+        return self.state.db.conn.execute(
+            "SELECT * FROM property WHERE property_id = ?", (property_id,)
+        ).fetchone()
+
+    def next_property_id(self, ecosystem: int) -> int:
+        """The next free property id in `ecosystem`.
+
+        Arcade reserves ids 1 and 2 permanently (config.RESERVED_PROPERTY_IDS):
+        Omni uses them for OMNI and TOMNI, and Arcade has no base token (D-007),
+        so main-ecosystem properties start at 3.
+        """
+        floor = FIRST_PROPERTY_ID_MAIN if ecosystem == ECOSYSTEM_MAIN else FIRST_PROPERTY_ID_TEST
+        row = self.state.db.conn.execute(
+            "SELECT MAX(property_id) AS top FROM property WHERE ecosystem = ?", (ecosystem,)
+        ).fetchone()
+        if row is None or row["top"] is None:
+            return floor
+        candidate = row["top"] + 1
+        while candidate in RESERVED_PROPERTY_IDS:
+            candidate += 1
+        return max(candidate, floor)
+
+    # --- entry point ----------------------------------------------------------
+
+    def process(self, rtx: ArcadeTransaction) -> Result:
+        """Decode and apply one transaction.
+
+        An unsupported message type propagates out of here and stops the indexer.
+        An invalid transaction is recorded and changes nothing.
+        """
+        message = P.decode(rtx.payload)   # raises for unsupported types -- by design
+
+        result = Result(
+            valid=True, message_type=message.TYPE, message_version=message.version
+        )
+        if self.names_only and not self._is_name(message):
+            result.valid = False
+            result.reason = "below the floor: only @names are read here"
+            return result
+        try:
+            self._apply(rtx, message)
+        except InvalidTransaction as exc:
+            result.valid = False
+            result.reason = str(exc)
+
+        self.state.insert(
+            "arcade_tx",
+            {
+                "txid": rtx.txid,
+                "block_height": rtx.block_height,
+                "position": rtx.position,
+                "encoding_class": rtx.encoding_class.value,
+                "message_type": message.TYPE,
+                "message_version": message.version,
+                "sender": rtx.sender,
+                "reference": rtx.reference,
+                "payload_hex": rtx.payload.hex(),
+                "valid": 1 if result.valid else 0,
+                "invalid_reason": result.reason,
+            },
+        )
+        return result
+
+    @staticmethod
+    def _is_name(message: P.Message) -> bool:
+        """A tag claim or transfer: the one thing read below the floor."""
+        data = getattr(message, "data", b"") if isinstance(message, P.AnyData) else b""
+        return (I.is_inscription(data) and len(data) > 5
+                and data[5] in (T.KIND_CLAIM, T.KIND_TRANSFER))
+
+    def _apply(self, rtx: ArcadeTransaction, message: P.Message) -> None:
+        handler = {
+            P.SimpleSend: self._simple_send,
+            P.SendAll: self._send_all,
+            P.IssuanceFixed: self._issuance_fixed,
+            P.IssuanceManaged: self._issuance_managed,
+            P.Grant: self._grant,
+            P.Revoke: self._revoke,
+            P.ChangeIssuer: self._change_issuer,
+            P.ActivateFeature: self._activate_feature,
+            P.DeactivateFeature: self._deactivate_feature,
+            P.Alert: self._alert,
+            P.AnyData: self._any_data,
+            P.MetaDExTrade: self._book_order,
+            P.MetaDExCancelPrice: self._book_cancel_price,
+            P.MetaDExCancelPair: self._book_cancel_pair,
+            P.MetaDExTake: self._take_order,
+        }.get(type(message))
+
+        if handler is None:
+            raise InvalidTransaction(
+                f"message type {message.TYPE} is recognised but not yet implemented "
+                f"(arrives in a later milestone)"
+            )
+        handler(rtx, message)
+
+    # --- type 0 ---------------------------------------------------------------
+
+    def _simple_send(self, rtx: ArcadeTransaction, msg: P.SimpleSend) -> None:
+        """Type 0. tx.cpp:logicMath_SimpleSend"""
+        if rtx.reference is None:
+            raise InvalidTransaction("simple send has no reference (recipient) address")
+        if not 0 < msg.amount <= MAX_AMOUNT:
+            raise InvalidTransaction(f"amount {msg.amount} out of range")
+
+        prop = self.get_property(msg.property_id)
+        if prop is None:
+            raise InvalidTransaction(f"property {msg.property_id} does not exist")
+        if prop["property_type"] == PROPERTY_NONFUNGIBLE:
+            raise InvalidTransaction(
+                f"property {msg.property_id} is non-fungible; use send type 5"
+            )
+
+        available = self.get_balance(rtx.sender, msg.property_id)["balance"]
+        if available < msg.amount:
+            raise InvalidTransaction(
+                f"insufficient balance: {rtx.sender} holds {available} of property "
+                f"{msg.property_id}, needs {msg.amount}"
+            )
+
+        self.debit(rtx.sender, msg.property_id, msg.amount)
+        self.credit(rtx.reference, msg.property_id, msg.amount)
+
+    # --- type 4 ---------------------------------------------------------------
+
+    def _send_all(self, rtx: ArcadeTransaction, msg: P.SendAll) -> None:
+        """Type 4. Moves every non-zero balance in one ecosystem."""
+        if rtx.reference is None:
+            raise InvalidTransaction("send all has no reference (recipient) address")
+        if msg.ecosystem not in (ECOSYSTEM_MAIN, ECOSYSTEM_TEST):
+            raise InvalidTransaction(f"invalid ecosystem {msg.ecosystem}")
+
+        rows = self.state.db.conn.execute(
+            "SELECT b.property_id, b.balance FROM balance b "
+            "JOIN property p ON p.property_id = b.property_id "
+            "WHERE b.address = ? AND p.ecosystem = ? AND b.balance > 0 "
+            "ORDER BY b.property_id",
+            (rtx.sender, msg.ecosystem),
+        ).fetchall()
+
+        if not rows:
+            raise InvalidTransaction(
+                f"{rtx.sender} holds nothing in ecosystem {msg.ecosystem}"
+            )
+
+        for row in rows:
+            self.debit(rtx.sender, row["property_id"], row["balance"])
+            self.credit(rtx.reference, row["property_id"], row["balance"])
+
+    # --- types 50 and 54 ------------------------------------------------------
+
+    def _validate_issuance(self, msg: Any) -> None:
+        if msg.ecosystem not in (ECOSYSTEM_MAIN, ECOSYSTEM_TEST):
+            raise InvalidTransaction(f"invalid ecosystem {msg.ecosystem}")
+        if msg.property_type not in ALL_PROPERTY_TYPES:
+            raise InvalidTransaction(f"invalid property type {msg.property_type}")
+        if not msg.name:
+            raise InvalidTransaction("property name must not be empty")
+        complaint = name_complaint(msg.name)
+        if complaint:
+            raise InvalidTransaction(complaint)
+
+    def _create_property(
+        self, rtx: ArcadeTransaction, msg: Any, managed: bool, total: int
+    ) -> int:
+        self._refuse_a_taken_name(msg)
+        property_id = self.next_property_id(msg.ecosystem)
+        self.state.insert(
+            "property",
+            {
+                "property_id": property_id,
+                "ecosystem": msg.ecosystem,
+                "property_type": msg.property_type,
+                "issuer": rtx.sender,
+                "category": msg.category,
+                "subcategory": msg.subcategory,
+                "name": msg.name,
+                "url": msg.url,
+                "data": msg.data,
+                "managed": 1 if managed else 0,
+                "total_tokens": total,
+                "creation_txid": rtx.txid,
+                "creation_block": rtx.block_height,
+            },
+        )
+        return property_id
+
+    def _refuse_a_taken_name(self, msg: Any) -> None:
+        """One name to a token, first claim wins, in chain order (D-122).
+
+        The same name was issued twice on two machines and both tokens are
+        real: a hundred of "Dogecoin Arcade" here and a hundred there, telling
+        anybody reading a balance, an order book or a shop two different
+        things with one word. A ticker is only useful because it is the same
+        object wherever it is quoted.
+
+        Compared folded (`name_key`), because a name that differs only in
+        case, spacing or punctuation is the same name to the person reading
+        it, and the ways to spell one name are endless. Per ecosystem, since
+        main and test are separate ledgers that happen to share this code.
+
+        Refused outright rather than renamed: an issuance that does not do
+        what it says is not one to keep, and the wallet that sent it will
+        have refused it first -- this is the rule for everyone else's node.
+        """
+        wanted = name_key(msg.name)
+        rows = self.state.db.conn.execute(
+            "SELECT name FROM property WHERE ecosystem = ?",
+            (msg.ecosystem,)).fetchall()
+        for row in rows:
+            if name_key(row["name"]) == wanted:
+                raise InvalidTransaction(
+                    f"the name {msg.name!r} is already a token on this chain")
+
+    def _issuance_fixed(self, rtx: ArcadeTransaction, msg: P.IssuanceFixed) -> None:
+        """Type 50. Entire supply is credited to the issuer at creation."""
+        self._validate_issuance(msg)
+        if not 0 < msg.amount <= MAX_AMOUNT:
+            raise InvalidTransaction(f"amount {msg.amount} out of range")
+
+        property_id = self._create_property(rtx, msg, managed=False, total=msg.amount)
+        self.credit(rtx.sender, property_id, msg.amount)
+
+    def _issuance_managed(self, rtx: ArcadeTransaction, msg: P.IssuanceManaged) -> None:
+        """Type 54. No supply at creation; tokens arrive via grants (type 55)."""
+        self._validate_issuance(msg)
+        self._create_property(rtx, msg, managed=True, total=0)
+
+    # --- types 55, 56 and 70: managing a property ----------------------------
+
+    def _managed_property(self, property_id: int) -> Any:
+        """The property row, if it exists and is managed. Shared by 55 and 56."""
+        prop = self.get_property(property_id)
+        if prop is None:
+            raise InvalidTransaction(f"property {property_id} does not exist")
+        if not prop["managed"]:
+            raise InvalidTransaction(
+                f"property {property_id} is not managed; its supply was fixed at creation"
+            )
+        return prop
+
+    def _grant(self, rtx: ArcadeTransaction, msg: P.Grant) -> None:
+        """Type 55. tx.cpp:logicMath_GrantTokens (2158-2257).
+
+        Only the issuer may grant -- Omni also allows a delegate, which arrives
+        with types 73/74 in M6, so until then the issuer is the only authority.
+        The tokens go to the reference address when there is one and otherwise
+        to the sender (tx.cpp:672-675, "assume grant to self").
+        """
+        if not 0 < msg.amount <= MAX_AMOUNT:
+            raise InvalidTransaction(f"amount {msg.amount} out of range")
+        prop = self._managed_property(msg.property_id)
+        if rtx.sender != prop["issuer"]:
+            raise InvalidTransaction(
+                f"{rtx.sender} is not the issuer of property {msg.property_id} "
+                f"(issuer is {prop['issuer']})"
+            )
+        if msg.amount > MAX_AMOUNT - prop["total_tokens"]:
+            raise InvalidTransaction(
+                f"granting {msg.amount} would take property {msg.property_id} past "
+                f"the {MAX_AMOUNT} tokens that can ever exist"
+            )
+
+        receiver = rtx.reference or rtx.sender
+        self.credit(receiver, msg.property_id, msg.amount)
+        self.state.update(
+            "property", {"property_id": msg.property_id},
+            {"total_tokens": prop["total_tokens"] + msg.amount},
+        )
+
+    def _revoke(self, rtx: ArcadeTransaction, msg: P.Revoke) -> None:
+        """Type 56. tx.cpp:logicMath_RevokeTokens (2260-2326).
+
+        Anyone holding a managed property may destroy their own tokens; there is
+        no issuer check, exactly as in Omni. Non-fungible properties are refused.
+        """
+        if not 0 < msg.amount <= MAX_AMOUNT:
+            raise InvalidTransaction(f"amount {msg.amount} out of range")
+        prop = self._managed_property(msg.property_id)
+        if prop["property_type"] == PROPERTY_NONFUNGIBLE:
+            raise InvalidTransaction(f"property {msg.property_id} is non-fungible")
+
+        held = self.get_balance(rtx.sender, msg.property_id)["balance"]
+        if held < msg.amount:
+            raise InvalidTransaction(
+                f"insufficient balance: {rtx.sender} holds {held} of property "
+                f"{msg.property_id}, cannot revoke {msg.amount}"
+            )
+        self.debit(rtx.sender, msg.property_id, msg.amount)
+        self.state.update(
+            "property", {"property_id": msg.property_id},
+            {"total_tokens": prop["total_tokens"] - msg.amount},
+        )
+
+    def _change_issuer(self, rtx: ArcadeTransaction, msg: P.ChangeIssuer) -> None:
+        """Type 70. tx.cpp:logicMath_ChangeIssuer (2329-2390).
+
+        The reference address becomes the issuer. Works for fixed and managed
+        properties alike; Omni's crowdsale checks do not apply (D-008).
+        """
+        prop = self.get_property(msg.property_id)
+        if prop is None:
+            raise InvalidTransaction(f"property {msg.property_id} does not exist")
+        if prop["property_type"] == PROPERTY_NONFUNGIBLE:
+            raise InvalidTransaction(f"property {msg.property_id} is non-fungible")
+        if rtx.sender != prop["issuer"]:
+            raise InvalidTransaction(
+                f"{rtx.sender} is not the issuer of property {msg.property_id} "
+                f"(issuer is {prop['issuer']})"
+            )
+        if rtx.reference is None:
+            raise InvalidTransaction("change issuer has no reference (new issuer) address")
+        self.state.update(
+            "property", {"property_id": msg.property_id}, {"issuer": rtx.reference}
+        )
+
+    # --- type 200: any data ---------------------------------------------------
+
+    def _any_data(self, rtx: ArcadeTransaction, msg: P.AnyData) -> None:
+        """Type 200. tx.cpp:logicMath_AnyData (2735-2747): valid, changes nothing.
+
+        Every Messenger transaction is one of these, so when testnet stands in
+        for the ledger (D-016) the indexer walks through thousands of them. They
+        are recorded like any other transaction and touch no balance.
+
+        Inscriptions ride in here too, behind their own magic. That is the whole
+        reason they do: a client that predates them reads this method, finds
+        nothing it knows, and carries on -- where an unrecognised payload TYPE
+        would have stopped it dead.
+        """
+        if not I.is_inscription(msg.data):
+            return None
+        if len(msg.data) > 5 and msg.data[5] in (T.KIND_CLAIM, T.KIND_TRANSFER):
+            try:
+                kind, tag = T.parse(msg.data)
+            except I.InscriptionError as exc:
+                raise InvalidTransaction(f"malformed tag: {exc}") from None
+            try:
+                T.validate(tag)
+            except T.TagError as exc:
+                raise InvalidTransaction(f"that tag cannot be claimed: {exc}") from None
+            return self._tag(rtx, kind, tag)
+
+        try:
+            parsed = I.parse(msg.data)
+        except I.InscriptionError as exc:
+            # Malformed, and that is all it is: the transaction is recorded as
+            # invalid and the index carries on. A stranger's broken payload must
+            # never be able to halt anybody's node.
+            raise InvalidTransaction(f"malformed inscription: {exc}") from None
+
+        if isinstance(parsed, I.Transfer):
+            self._inscription_transfer(rtx, parsed)
+        elif isinstance(parsed, I.Swap):
+            self._swap(rtx, parsed)
+        elif isinstance(parsed, I.Bundle):
+            self._bundle(rtx, parsed)
+        elif isinstance(parsed, I.Offer):
+            self._offer(rtx, parsed)
+        elif isinstance(parsed, I.Ask):
+            self._ask(rtx, parsed)
+        else:
+            self._inscription_chunk(rtx, parsed)
+
+    # --- types 25-27: the order book ------------------------------------------
+
+    #: Property 0 is the chain's own coin, which has no property row and no
+    #: balance to reserve. Omni has no such id; here the coin is one side of
+    #: every pair, so it needs a name (D-048).
+    COIN_PROPERTY = 0
+
+    def _book_order(self, rtx: ArcadeTransaction, msg: P.MetaDExTrade) -> None:
+        """Type 25. A standing order: this much, at this price, until cancelled.
+
+        What is sold is reserved when it is a token, so the book never shows
+        what the seller has since spent. Coins cannot be reserved -- there is
+        no covenant that would hold them and still let the wallet live -- so
+        an order to BUY is an intent, and whether the coins are there is
+        settled when somebody fills it and the transaction either stands up
+        or does not.
+
+        Nothing is matched here. A fill is a swap: one transaction both sides
+        sign, which is the only way a coin leg and a token leg move together
+        (D-048).
+        """
+        sale, want = msg.property_id_for_sale, msg.property_id_desired
+        if sale == want:
+            raise InvalidTransaction("an order has two different sides")
+        if self.COIN_PROPERTY not in (sale, want):
+            since = getattr(self.params, "token_pairs_from", None)
+            if since is None or rtx.block_height < since:
+                raise InvalidTransaction(
+                    "one side of an order is this chain's coin (property 0)")
+            return self._pair_order(rtx, msg)
+        if not 0 < msg.amount_for_sale <= MAX_AMOUNT:
+            raise InvalidTransaction(f"amount {msg.amount_for_sale} out of range")
+        if not 0 < msg.amount_desired <= MAX_AMOUNT:
+            raise InvalidTransaction(f"amount {msg.amount_desired} out of range")
+
+        token = want if sale == self.COIN_PROPERTY else sale
+        if self.get_property(token) is None:
+            raise InvalidTransaction(f"property {token} does not exist")
+
+        reserved = 0
+        if sale != self.COIN_PROPERTY:
+            available = self.get_balance(rtx.sender, sale)["balance"]
+            if available < msg.amount_for_sale:
+                raise InvalidTransaction(
+                    f"{rtx.sender} holds {available} of property {sale}, "
+                    f"not {msg.amount_for_sale}")
+            self._move_to_reserve(rtx.sender, sale, msg.amount_for_sale,
+                                  "metadex_reserve")
+            reserved = msg.amount_for_sale
+
+        self.state.insert("book_order", {
+            "txid": rtx.txid, "block_height": rtx.block_height,
+            "position": rtx.position, "address": rtx.sender,
+            "sale_property": sale, "sale_amount": msg.amount_for_sale,
+            "want_property": want, "want_amount": msg.amount_desired,
+            "reserved": reserved,
+        })
+
+    def _pair_order(self, rtx: ArcadeTransaction, msg: P.MetaDExTrade) -> None:
+        """Type 25 with two tokens (Params.token_pairs_from): sell `a` of A for
+        `b` of B, matched against the book at once.
+
+        Both sides are balances the ledger holds, so unlike a coin pair the
+        engine can settle a cross itself: the new order (the taker) meets the
+        resting orders selling B for A whose price is at or better than its
+        own, best price first and then the oldest, and trades at THEIR price.
+        It gets as much B as its A buys there; the maker is never paid less
+        than its price (amounts round in the maker's favour). What is left of
+        the new order rests on the book, its A held back, at its own price.
+        A sender's own resting orders are passed over, never traded against.
+        """
+        from fractions import Fraction
+        sale, want = msg.property_id_for_sale, msg.property_id_desired
+        a, b = msg.amount_for_sale, msg.amount_desired
+        if not 0 < a <= MAX_AMOUNT:
+            raise InvalidTransaction(f"amount {a} out of range")
+        if not 0 < b <= MAX_AMOUNT:
+            raise InvalidTransaction(f"amount {b} out of range")
+        for pid in (sale, want):
+            if self.get_property(pid) is None:
+                raise InvalidTransaction(f"property {pid} does not exist")
+        available = self.get_balance(rtx.sender, sale)["balance"]
+        if available < a:
+            raise InvalidTransaction(
+                f"{rtx.sender} holds {available} of property {sale}, not {a}")
+        self._move_to_reserve(rtx.sender, sale, a, "metadex_reserve")
+
+        rows = [dict(r) for r in self.state.db.conn.execute(
+            "SELECT * FROM book_order WHERE sale_property=? AND want_property=? "
+            "AND address<>? AND sale_amount>0 AND want_amount>0",
+            (want, sale, rtx.sender)).fetchall()]
+        # the maker's price in A per B; cheapest first, then first on the book
+        rows.sort(key=lambda r: (Fraction(r["want_amount"], r["sale_amount"]),
+                                 r["block_height"], r["position"], r["txid"]))
+        left, seq = a, 0
+        for r in rows:
+            if left <= 0:
+                break
+            ma, mb = r["want_amount"], r["sale_amount"]      # maker wants ma A for mb B
+            if ma * b > a * mb:                              # dearer than the taker's price
+                break
+            got = min(mb, left * mb // ma)                   # B the taker's A buys there
+            gave = -(-got * ma // mb)                        # A for it, rounded up for the maker
+            while got > 0 and gave > left:
+                got -= 1
+                gave = -(-got * ma // mb)
+            if got <= 0:
+                continue
+            # taker's A: from its reserve to the maker
+            self.debit(rtx.sender, sale, gave, "metadex_reserve")
+            self.credit(r["address"], sale, gave)
+            # maker's B: from its reserve to the taker
+            self.debit(r["address"], want, got, "metadex_reserve")
+            self.credit(rtx.sender, want, got)
+            rest = mb - got
+            if rest <= 0:
+                self.state.delete("book_order", {"txid": r["txid"]})
+            else:
+                rest_want = -(-rest * ma // mb)              # same price for what is left
+                self.state.update("book_order", {"txid": r["txid"]}, {
+                    "sale_amount": rest, "want_amount": max(1, rest_want),
+                    "reserved": r["reserved"] - got})
+            self.state.insert("pair_trade", {
+                "txid": rtx.txid, "seq": seq, "block_height": rtx.block_height,
+                "position": rtx.position, "taker": rtx.sender,
+                "maker": r["address"], "maker_txid": r["txid"],
+                "gave_property": sale, "gave": gave,
+                "got_property": want, "got": got})
+            seq += 1
+            left -= gave
+
+        rest_want = -(-left * b // a) if left > 0 else 0     # the taker's own price
+        if left > 0 and rest_want > 0:
+            self.state.insert("book_order", {
+                "txid": rtx.txid, "block_height": rtx.block_height,
+                "position": rtx.position, "address": rtx.sender,
+                "sale_property": sale, "sale_amount": left,
+                "want_property": want, "want_amount": rest_want,
+                "reserved": left})
+        elif left > 0:
+            self._move_from_reserve(rtx.sender, sale, left, "metadex_reserve")
+
+    def _book_cancel_price(self, rtx: ArcadeTransaction,
+                           msg: P.MetaDExCancelPrice) -> None:
+        """Type 26. Cancel this sender's orders on one pair at one exact price.
+
+        Exact, as a pair of integers: 3 for 2 and 6 for 4 are the same price
+        and both are cancelled; 3 for 2 and 3 for 2.000001 are not.
+        """
+        self._cancel_orders(
+            rtx, msg.property_id_for_sale, msg.property_id_desired,
+            price=(msg.amount_desired, msg.amount_for_sale))
+
+    def _book_cancel_pair(self, rtx: ArcadeTransaction,
+                          msg: P.MetaDExCancelPair) -> None:
+        """Type 27. Cancel every order this sender has on one pair."""
+        self._cancel_orders(rtx, msg.property_id_for_sale,
+                            msg.property_id_desired, price=None)
+
+    def _take_order(self, rtx: ArcadeTransaction, msg: P.MetaDExTake) -> None:
+        """Type 29. Settle somebody else's resting ask without them.
+
+        The maker signed once, when they filed the order, and what that
+        signature bought is the reserve `_book_order` moved out of their
+        balance and into `metadex_reserve` -- a column a token send cannot
+        spend, so the promise behind the price has been held ever since. Every
+        other way to fill an ask asked the maker to be awake: a swap needs both
+        inputs, and an account's key lives in its owner's tab, not on this
+        node. This is the one that works while they sleep.
+
+        What makes it safe to move a token somebody did not sign for is that
+        three things are all the same number: what the order holds, what this
+        message asks for, and what the transaction pays for at the order's own
+        price. Each is checked against each other before anything moves, and
+        any one of them failing makes the transaction invalid rather than
+        partial -- which is the whole point, because coins are the one side of
+        this that the chain moves by itself. A fill that released fewer tokens
+        than it was paid for would be a taker who paid and received nothing,
+        and no `if` downstream can undo that after the block. So there is no
+        "named and unusable, the swap still stands" here (the rule at
+        `_fills_for`, which is right there only because a swap's coin leg
+        cannot be refused without cheating somebody): here it is refused. And
+        a refusal costs the taker the payment, not only the fee -- the coins
+        went to the maker as ordinary outputs, which the chain moves whatever
+        this layer decides. So the two ways that loss could fall on somebody
+        are built out rather than left as a risk: a block applies its cancels
+        after its takes (`cancels_last_from`, deferred by `indexer.on_connect`),
+        and a take that outran what the order still holds is covered from the
+        maker's free balance. What is left is an order that died in an earlier
+        block, and there the honest words are: the coins are with the maker,
+        no token moved, and the taker tries again.
+
+        A partial fill is the ordinary case, not a special one: take less than
+        the order holds and what is left keeps its price, exactly as a swap's
+        fill leaves it (D-062).
+        """
+        since = self.params.take_from
+        if since is None or rtx.block_height < since:
+            raise InvalidTransaction(
+                "an order is taken with its maker's signature until this block")
+        if len(msg.order) != 32:
+            raise InvalidTransaction("a take names the order by its txid")
+        if not 0 < msg.amount <= MAX_AMOUNT:
+            raise InvalidTransaction(f"amount {msg.amount} out of range")
+        prop = self.get_property(msg.property_id)
+        if prop is None:
+            raise InvalidTransaction(f"property {msg.property_id} does not exist")
+        if prop["property_type"] == PROPERTY_NONFUNGIBLE:
+            raise InvalidTransaction(
+                f"property {msg.property_id} is non-fungible -- a take moves "
+                f"a balance the way a fill does, not one piece by its id")
+
+        row = self.state.db.conn.execute(
+            "SELECT * FROM book_order WHERE txid=?",
+            (msg.order.hex(),)).fetchone()
+        if row is None and (self.params.cancels_last_from is not None
+                            and rtx.block_height >= self.params.cancels_last_from):
+            # Emptied earlier in this same block by another take: the race
+            # the route cannot see. Its maker was paid by this transaction
+            # too, so the shortfall comes from their free balance below.
+            row = getattr(self, "_emptied", {}).get(msg.order.hex())
+        if row is None:
+            raise InvalidTransaction(
+                "that order is not on the book -- filled, cancelled, or its "
+                "block has not reached this node")
+        row = dict(row)
+        if row["address"] == rtx.sender:
+            raise InvalidTransaction(
+                "an order is a promise to somebody else; taking your own "
+                "withdraws it, and type 26 or 27 says that")
+        if row["sale_property"] != msg.property_id\
+                or row["want_property"] != self.COIN_PROPERTY:
+            raise InvalidTransaction(
+                f"that order sells {row['sale_property']} for "
+                f"{row['want_property']}, and holds nothing of property "
+                f"{msg.property_id}")
+        # From `cancels_last_from`: a take that asks for more than the order
+        # still holds (two takes of one order in one block) is not refused
+        # outright while its payment stands. It takes all the order holds and
+        # the shortfall from the maker's free balance of the same token, which
+        # the maker was paid for (a review of D-189, 2026-09-27).
+        graceful = (self.params.cancels_last_from is not None
+                    and rtx.block_height >= self.params.cancels_last_from)
+        from_book = min(msg.amount, row["reserved"])
+        from_free = 0
+        if from_book < msg.amount:
+            if not graceful:
+                raise InvalidTransaction(
+                    f"that order holds {row['reserved']} of property "
+                    f"{msg.property_id}, not {msg.amount}")
+            free = self.get_balance(row["address"], msg.property_id)["balance"]
+            from_free = max(0, min(msg.amount - from_book, free))
+
+        # The order's price, applied to what this take moves, is what the
+        # transaction has to have paid the maker -- floor, so a remainder of
+        # the order is never dearer than the whole was. Rounded the other way
+        # and a taker pays for tokens nobody sold.
+        need = row["want_amount"] * msg.amount // row["sale_amount"]
+        if need < 1:
+            raise InvalidTransaction(
+                "that much of this order is worth less than a satoshi; take more")
+        paid = rtx.paid_to(row["address"])
+        if paid < need:
+            raise InvalidTransaction(
+                f"{row['address']} is paid {paid} satoshis by this "
+                f"transaction; that order's price makes it {need}")
+
+        # Everything below is what a swap's fill already does, and it is the
+        # same three moves so the two ways of filling an order cannot drift:
+        # out of the reserve, off the order, into the taker. `from_free` is
+        # the shortfall a race left, taken from the maker's own balance.
+        if from_book:
+            self._fill_order(row, from_book,
+                             row["want_amount"] * from_book // row["sale_amount"])
+        moved = from_book + from_free
+        self.debit(row["address"], msg.property_id, moved)
+        self.credit(rtx.sender, msg.property_id, moved)
+        # The trade, for the chart and the pair page's numbers (ledger.trades).
+        self.state.insert("take_trade", {"txid": rtx.txid, "property_id": msg.property_id,
+                                         "tokens": moved, "coins": paid,
+                                         "maker": row["address"]})
+
+    def _cancel_orders(self, rtx: ArcadeTransaction, sale: int, want: int,
+                       price: tuple[int, int] | None) -> None:
+        rows = self.state.db.conn.execute(
+            "SELECT * FROM book_order WHERE address=? AND sale_property=? "
+            "AND want_property=?", (rtx.sender, sale, want)).fetchall()
+        hit = []
+        for row in rows:
+            if price is not None:
+                # a/b == c/d without dividing anything
+                if price[0] * row["sale_amount"] != price[1] * row["want_amount"]:
+                    continue
+            hit.append(row)
+        if not hit:
+            raise InvalidTransaction("no order of yours matches that")
+        for row in hit:
+            self._close_order(row)
+
+    def _close_order(self, row: Any) -> None:
+        """Take an order off the book and give back whatever it was holding."""
+        if row["reserved"]:
+            self._move_from_reserve(row["address"], row["sale_property"],
+                                    row["reserved"], "metadex_reserve")
+        self.state.delete("book_order", {"txid": row["txid"]})
+
+    def _move_to_reserve(self, address: str, property_id: int, amount: int,
+                         column: str) -> None:
+        balance = self.get_balance(address, property_id)
+        self.state.update("balance", {"address": address, "property_id": property_id},
+                          {"balance": balance["balance"] - amount,
+                           column: balance[column] + amount})
+
+    def _move_from_reserve(self, address: str, property_id: int, amount: int,
+                           column: str) -> None:
+        balance = self.get_balance(address, property_id)
+        self.state.update("balance", {"address": address, "property_id": property_id},
+                          {"balance": balance["balance"] + amount,
+                           column: max(0, balance[column] - amount)})
+
+    def _offer(self, rtx: ArcadeTransaction, offer: I.Offer) -> None:
+        """Write down an offer for an inscription. Nothing moves.
+
+        Refused when the inscription is not one this chain has, when the
+        offer is for nothing, and when it is the holder offering for their
+        own thing -- none of which anybody could act on. Everything else is
+        recorded: whether the buyer can pay is answered when the holder
+        accepts and the swap is built, not here, because a balance at this
+        block says nothing about a balance three blocks later.
+        """
+        found = self.state.db.conn.execute(
+            "SELECT owner FROM inscription WHERE txid=?",
+            (offer.txid.hex(),)).fetchone()
+        if found is None:
+            raise InvalidTransaction("there is no such inscription on this chain")
+        if found["owner"] == rtx.sender:
+            raise InvalidTransaction("that one is already yours")
+        if not offer.take.amount and offer.take.kind != I.LEG_INSCRIPTION:
+            raise InvalidTransaction("an offer of nothing is not an offer")
+        self.state.insert("nft_offer", {
+            "txid": rtx.txid,
+            "block_height": rtx.block_height,
+            "position": rtx.position,
+            "inscription": offer.txid.hex(),
+            "buyer": rtx.sender,
+            "take_kind": offer.take.kind,
+            "take_property": offer.take.property_id or None,
+            "take_amount": int(offer.take.amount or 0),
+        })
+
+    def _ask(self, rtx: ArcadeTransaction, ask: I.Ask) -> None:
+        """Write down what the holder wants for a piece. Nothing moves.
+
+        Only the current owner may price a piece, and the price is in coins
+        or in a token -- an ask that wanted another inscription would be a
+        barter nobody could match against a number, and the marketplace is
+        built on numbers.
+
+        Nothing is reserved. There is no way on this chain to hold an
+        inscription back from its owner, and pretending otherwise would be a
+        promise the ledger cannot keep -- the same reason a bid holds no
+        coins (D-048). What makes an ask honest instead is that it is checked
+        against the chain when it is READ: `ledger.asks` drops any whose
+        seller no longer holds the piece, so a sold or sent-away piece
+        withdraws its own price.
+        """
+        since = self.params.asks_from
+        if since is None:
+            raise InvalidTransaction("asks are not read on this chain")
+        if rtx.block_height < since:
+            raise InvalidTransaction(f"asks are read from block {since}")
+        found = self.state.db.conn.execute(
+            "SELECT owner FROM inscription WHERE txid=?",
+            (ask.txid.hex(),)).fetchone()
+        if found is None:
+            raise InvalidTransaction("there is no such inscription on this chain")
+        if found["owner"] != rtx.sender:
+            raise InvalidTransaction("only the holder of an inscription can price it")
+        if ask.take.kind == I.LEG_INSCRIPTION:
+            raise InvalidTransaction("an ask is priced in coins or in a token")
+        if not ask.cancelled and not ask.take.amount:
+            raise InvalidTransaction("an ask for nothing is not an ask")
+        self.state.insert("nft_ask", {
+            "txid": rtx.txid,
+            "block_height": rtx.block_height,
+            "position": rtx.position,
+            "inscription": ask.txid.hex(),
+            "seller": rtx.sender,
+            "take_kind": ask.take.kind,
+            "take_property": ask.take.property_id or None,
+            "take_amount": int(ask.take.amount or 0),
+        })
+
+    def _tag(self, rtx: ArcadeTransaction, kind: int, tag: str) -> None:
+        """Claim a tag, or hand one to the reference address."""
+        held = self.state.db.conn.execute(
+            "SELECT tag, address FROM tag WHERE tag=?", (tag,)).fetchone()
+        mine = self.state.db.conn.execute(
+            "SELECT tag FROM tag WHERE address=?", (rtx.sender,)).fetchone()
+
+        if kind == T.KIND_TRANSFER:
+            if held is None or held["address"] != rtx.sender:
+                raise InvalidTransaction("that tag is not yours to send")
+            if not rtx.reference:
+                raise InvalidTransaction("a transfer needs a reference address")
+            if rtx.reference == rtx.sender:
+                raise InvalidTransaction("that tag is already there")
+            taken = self.state.db.conn.execute(
+                "SELECT tag FROM tag WHERE address=?", (rtx.reference,)).fetchone()
+            if taken is not None:
+                # Refused rather than replaced: quietly dropping somebody's
+                # existing name because a stranger sent them another is a way to
+                # lose a name without being asked.
+                raise InvalidTransaction(
+                    f"that address already holds @{taken['tag']}")
+            self.state.update("tag", {"tag": tag}, {"address": rtx.reference,
+                                                    "claimed_txid": rtx.txid,
+                                                    "block_height": rtx.block_height,
+                                                    "position": rtx.position})
+            return
+
+        if held is not None:
+            raise InvalidTransaction(
+                "that tag is already yours" if held["address"] == rtx.sender
+                else "that tag is taken")
+        if mine is not None:
+            # Changing your tag frees the old one: holding names you no longer
+            # use is how a namespace fills up with nothing.
+            self.state.delete("tag", {"tag": mine["tag"]})
+        self.state.insert("tag", {
+            "tag": tag, "address": rtx.sender, "claimed_txid": rtx.txid,
+            "block_height": rtx.block_height, "position": rtx.position})
+
+    # --- inscriptions ---------------------------------------------------------
+
+    def _inscription_chunk(self, rtx: ArcadeTransaction, chunk: I.Chunk) -> None:
+        """One piece of an inscription. The last one to arrive completes it."""
+        key = {"sender": rtx.sender,
+               "inscription_id": chunk.inscription_id.hex(),
+               "countdown": chunk.countdown}
+        seen = self.state.db.conn.execute(
+            "SELECT 1 FROM inscription_chunk WHERE sender=? AND inscription_id=? "
+            "AND countdown=?", (key["sender"], key["inscription_id"],
+                                key["countdown"])).fetchone()
+        if seen is not None:
+            raise InvalidTransaction("that piece of the inscription is already on chain")
+
+        self.state.insert("inscription_chunk", {
+            **key, "txid": rtx.txid, "block_height": rtx.block_height,
+            "position": rtx.position, "body": chunk.body})
+
+        rows = self.state.db.conn.execute(
+            "SELECT * FROM inscription_chunk WHERE sender=? AND inscription_id=?",
+            (rtx.sender, chunk.inscription_id.hex())).fetchall()
+        assembly = I.Assembly(inscription_id=chunk.inscription_id)
+        first = None
+        for row in rows:
+            assembly.pieces[row["countdown"]] = bytes(row["body"])
+            if first is None or row["countdown"] > first["countdown"]:
+                first = row
+        if not assembly.complete():
+            return None
+
+        try:
+            manifest, content = assembly.join()
+        except I.InscriptionError as exc:
+            # Every piece is here and they do not make the file the manifest
+            # describes. Leave the pieces: a later, correct set from the same
+            # sender under a different id still works, and throwing away chain
+            # data on a hunch is worse than keeping it.
+            raise InvalidTransaction(f"inscription does not assemble: {exc}") from None
+
+        self.state.insert("inscription", {
+            # Named by the piece that carried the manifest, which is fixed the
+            # moment it is broadcast and does not depend on what order the rest
+            # confirmed in.
+            "txid": first["txid"],
+            "number": self._next_inscription_number(),
+            "creator": rtx.sender,
+            "owner": rtx.sender,
+            # Where it BECAME an inscription, which is what the numbering and
+            # every replay agree on.
+            "block_height": rtx.block_height,
+            "position": rtx.position,
+            "content_type": manifest.content_type,
+            "content_len": manifest.total,
+            "sha256": manifest.sha256.hex(),
+            "json": manifest.json,
+            "chunks": len(assembly.pieces),
+            # Not kept. The file is on the chain in full and this index says
+            # which transactions hold it, so keeping a second copy here was
+            # paying twice to store what cannot be lost (D-113). A node that
+            # wants the bytes to hand -- a gallery serving strangers -- says
+            # so with `keep_content`.
+            "content": content if self.keep_content(rtx.sender) else None,
+        })
+        for row in rows:
+            self.state.insert("inscription_piece", {
+                "inscription": first["txid"],
+                "countdown": row["countdown"],
+                "txid": row["txid"],
+            })
+        member = I.collection_of(manifest.json)
+        if member is not None:
+            collection, edition, name = member
+            if not joins_collection(self.state.db.conn, rtx.sender,
+                                    collection, edition, name):
+                member = None
+        if member is not None:
+            self.state.insert("collection_item", {
+                "txid": first["txid"], "creator": rtx.sender,
+                "collection": collection, "edition": edition, "name": name})
+        for row in rows:
+            self.state.delete("inscription_chunk", {
+                "sender": row["sender"], "inscription_id": row["inscription_id"],
+                "countdown": row["countdown"]})
+
+    def _next_inscription_number(self) -> int:
+        row = self.state.db.conn.execute(
+            "SELECT MAX(number) AS n FROM inscription").fetchone()
+        highest = row["n"] if row and row["n"] is not None else -1
+        return highest + 1
+
+    def _inscription_transfer(self, rtx: ArcadeTransaction, move: I.Transfer) -> None:
+        """Hand an inscription to the reference address. Only the owner may."""
+        txid = move.txid.hex()
+        existing = self.state.db.conn.execute(
+            "SELECT owner FROM inscription WHERE txid=?", (txid,)).fetchone()
+        if existing is None:
+            raise InvalidTransaction("no such inscription")
+        if existing["owner"] != rtx.sender:
+            raise InvalidTransaction(
+                "only the owner of an inscription can send it")
+        if not rtx.reference:
+            raise InvalidTransaction("a transfer needs a reference address")
+        if rtx.reference == existing["owner"]:
+            raise InvalidTransaction("that inscription is already there")
+        self.state.update("inscription", {"txid": txid}, {"owner": rtx.reference})
+        self._note_move(rtx, txid, existing["owner"], rtx.reference, "transfer")
+
+    def _note_move(self, rtx: ArcadeTransaction, inscription: str, giver: str,
+                   taker: str, how: str) -> None:
+        """Write down that a piece changed hands. Keyed by the transaction, so
+        replaying a block cannot double it, and journalled so a reorg unwinds
+        it with everything else."""
+        self.state.insert("inscription_move", {
+            "txid": rtx.txid, "inscription": inscription,
+            "from_address": giver, "to_address": taker,
+            "block_height": rtx.block_height, "position": rtx.position,
+            "how": how,
+        })
+
+    # --- swaps ----------------------------------------------------------------
+
+    def _bundle(self, rtx: ArcadeTransaction, bundle: I.Bundle) -> None:
+        """Two named parties trade several things each way, or nothing moves
+        (2026-10-04). `a` gives `give` to `b`; `b` gives `take` to `a`.
+
+        Who the parties are is said, not inferred: a bundle is Class B, whose
+        sender is whoever put in the most, so it names them, and the inputs
+        prove them -- each must have signed one, and nobody else may have. Every
+        leg is checked against what its giver holds, token legs summed per token
+        first so two legs of one token cannot each count the same balance, and
+        coin legs against what the transaction actually leaves the taker. Then
+        everything moves.
+        """
+        from .script import b58check_encode
+        since = self.params.bundles_from
+        if since is None:
+            raise InvalidTransaction("bundles are not read on this chain")
+        if rtx.block_height < since:
+            raise InvalidTransaction(f"bundles are read from block {since}")
+        a = b58check_encode(bundle.a[0], bundle.a[1:])
+        b = b58check_encode(bundle.b[0], bundle.b[1:])
+        if a == b:
+            raise InvalidTransaction("a bundle needs two different parties")
+        if not (rtx.signed_by(a) and rtx.signed_by(b)):
+            raise InvalidTransaction("both parties of a bundle must sign it")
+        if any(where not in (a, b) for where, _ in rtx.inputs):
+            raise InvalidTransaction("a bundle is signed by its two parties and nobody else")
+        seen: set[bytes] = set()
+        coins = {a: 0, b: 0}
+        tokens: dict[tuple[str, int], int] = {}
+        for legs, giver, taker in ((bundle.give, a, b), (bundle.take, b, a)):
+            for leg in legs:
+                if leg.kind == I.LEG_INSCRIPTION:
+                    if leg.txid in seen:
+                        raise InvalidTransaction("a bundle names one inscription twice")
+                    seen.add(leg.txid)
+                    self._check_leg(rtx, leg, giver, taker)
+                elif leg.kind == I.LEG_TOKEN:
+                    key = (giver, leg.property_id)
+                    tokens[key] = tokens.get(key, 0) + leg.amount
+                elif leg.kind == I.LEG_COINS:
+                    coins[taker] += leg.amount
+                else:
+                    raise InvalidTransaction(f"unknown bundle leg {leg.kind}")
+        for (giver, pid), total in tokens.items():
+            self._check_leg(rtx, I.Leg(I.LEG_TOKEN, property_id=pid, amount=total),
+                            giver, b if giver == a else a)
+        if coins[a] and coins[b]:
+            raise InvalidTransaction("a bundle pays coins one way only")
+        for taker, owed in coins.items():
+            if owed and rtx.paid_to(taker) < owed:
+                raise InvalidTransaction(
+                    f"{taker} is paid {rtx.paid_to(taker)} satoshis by this transaction, "
+                    f"the bundle says {owed}")
+        for legs, giver, taker in ((bundle.give, a, b), (bundle.take, b, a)):
+            for leg in legs:
+                if leg.kind != I.LEG_COINS:
+                    self._move_leg(leg, giver, taker, rtx)
+
+    def _swap(self, rtx: ArcadeTransaction, swap: I.Swap) -> None:
+        """Two parties trade in one transaction, or nothing moves.
+
+        The seller is the sender -- Class C, so the first input, which a
+        buyer building the transaction cannot shift by adding bigger inputs
+        of their own. The buyer is the first input that is not the seller's:
+        an input is a signature, since nobody else can spend it, and the
+        payload has no room to name the buyer (inscriptions.Swap). Both legs
+        are checked before either moves, so a swap is never half done. Coins
+        are counted on the transaction itself: what the receiving side ends
+        up with, net of what it put in, must cover the leg.
+        """
+        since = self.params.swaps_from
+        if since is None:
+            raise InvalidTransaction("swaps are not read on this chain")
+        if rtx.block_height < since:
+            raise InvalidTransaction(f"swaps are read from block {since}")
+        if rtx.encoding_class is not EncodingClass.C:
+            raise InvalidTransaction("a swap must be Class C so its seller is the first input")
+        seller = rtx.sender
+        buyer = next((where for where, _ in rtx.inputs
+                      if where is not None and where != seller), None)
+        if buyer is None:
+            raise InvalidTransaction("a swap needs two parties: every input is the seller's")
+        if swap.give.kind == I.LEG_NONE or swap.take.kind == I.LEG_NONE:
+            raise InvalidTransaction("a swap has two sides")
+
+        # What the seller has on the book, this swap may take out of. Worked
+        # out before anything is checked and applied after everything is, so a
+        # swap is still never half done.
+        fills = self._fills_for(rtx, seller, swap.give, swap.take,
+                                named=getattr(swap, "order", b""))
+        # And the BUYER's own bid, if this swap names one. A bid reserves
+        # nothing, so nothing comes out of it -- what is wrong without this is
+        # that the book goes on advertising an intention the buyer has already
+        # acted on (D-118).
+        bids = self._bid_fills_for(rtx, buyer, swap.give, swap.take,
+                                   named=getattr(swap, "order", b""))
+        self._check_leg(rtx, swap.give, seller, buyer,
+                        extra=sum(taken for _, taken, _ in fills))
+        self._check_leg(rtx, swap.take, buyer, seller)
+        for row, taken, want in fills:
+            self._fill_order(row, taken, want)
+        for row, taken, spent in bids:
+            self._reduce_bid(row, taken, spent)
+        self._move_leg(swap.give, seller, buyer, rtx)
+        self._move_leg(swap.take, buyer, seller, rtx)
+
+    def _fills_for(self, rtx: ArcadeTransaction, seller: str, give: I.Leg,
+                   take: I.Leg, named: bytes = b"") -> list[tuple[dict, int, int]]:
+        """The seller's orders this swap fills: (order, tokens, coins) each.
+
+        A resting ask holds its tokens in `metadex_reserve`, where a swap
+        cannot reach them, so before this the only way to fill one was to
+        cancel it first -- which takes a block, and tells everybody the price
+        is gone before the trade that was meant to take it.
+
+        Which orders are consumed is a pure function of indexed state, so
+        every node picks the same ones in the same order: cheapest first,
+        then oldest, then by txid. The swap does not name them and does not
+        need to -- what it names is what moves, and the price guard below is
+        what protects the maker.
+
+        The guard: this swap must pay at least the order's own price for what
+        it takes. An order is a public promise to sell at a price, and the
+        reserve behind it may be spent at that price or better, never worse.
+        The maker signs the transaction as well -- an input is a signature --
+        so consent is explicit; this is the rule that holds when a wallet
+        signs something it did not read carefully (D-062).
+        """
+        from fractions import Fraction
+
+        since = self.params.fills_from
+        if since is None or rtx.block_height < since:
+            return []
+        if give.kind != I.LEG_TOKEN or take.kind != I.LEG_COINS:
+            return []                     # only a token sold for coins is a fill
+        rows = [dict(r) for r in self.state.db.conn.execute(
+            "SELECT * FROM book_order WHERE address=? AND sale_property=? "
+            "AND want_property=? AND reserved>0",
+            (seller, give.property_id, self.COIN_PROPERTY))]
+        if not rows:
+            return []
+        rows.sort(key=lambda r: (Fraction(r["want_amount"], r["sale_amount"]),
+                                 r["block_height"], r["position"], r["txid"]))
+
+        # A swap that NAMES an order fills that order, whatever the seller has
+        # loose. Deriving it was the mistake: "sold 333 at 0.012 while
+        # advertising 500 at 0.012" is produced byte-identically by a fill of
+        # the advertisement and by a private sale beside it, and which one it
+        # was is a fact about what the taker asked for, not about state. The
+        # first live fill proved it -- the trade went through, the tokens came
+        # out of a large free balance, and the book went on advertising what
+        # had just been sold (D-082).
+        if named and self.params.named_fills_from is not None\
+                and rtx.block_height >= self.params.named_fills_from:
+            want = named.hex()
+            for row in rows:
+                if row["txid"] != want:
+                    continue
+                # The same price guard. A named order is a preference, so a
+                # price this swap does not meet means the order is left alone,
+                # never that the swap is refused.
+                if take.amount * row["sale_amount"] < row["want_amount"] * give.amount:
+                    break
+                taken = min(give.amount, row["reserved"], row["sale_amount"])
+                if taken <= 0:
+                    break
+                return [(row, taken, row["want_amount"] * taken // row["sale_amount"])]
+            # Named and unusable -- gone, re-priced, or emptied since the
+            # taker asked. The swap still stands: its coin leg settles on the
+            # chain below whether this layer likes it or not, and refusing it
+            # here would mean somebody paid and received nothing.
+            return []
+
+        held = self.get_balance(seller, give.property_id)["balance"]
+        need = give.amount - held         # what the free balance cannot cover
+        out: list[tuple[dict, int, int]] = []
+        for row in rows:
+            if need <= 0:
+                break
+            # take.amount/give.amount >= want/sale, without dividing anything
+            if take.amount * row["sale_amount"] < row["want_amount"] * give.amount:
+                continue
+            taken = min(need, row["reserved"], row["sale_amount"])
+            if taken <= 0:
+                continue
+            # Rounded down, so what is left of the order keeps at least the
+            # price it had. Rounding the other way would let a fill leave a
+            # remainder cheaper than the maker ever offered.
+            want = row["want_amount"] * taken // row["sale_amount"]
+            out.append((row, taken, want))
+            need -= taken
+        return out
+
+    def _bid_fills_for(self, rtx: ArcadeTransaction, buyer: str, give: I.Leg,
+                       take: I.Leg, named: bytes = b"") -> list[tuple[dict, int, int]]:
+        """The buyer's own bid this swap fills: (order, tokens, coins).
+
+        The mirror of `_fills_for`, and it exists for the same reason: a book
+        that advertises what has already been committed is the state D-082 is
+        about. An ask is reduced because the tokens come out of the reserve it
+        holds; a bid holds nothing, so nothing moves -- but the ORDER is still
+        a public statement of what somebody will buy, and buying it makes the
+        statement smaller.
+
+        NAMED only, never derived. Which of a buyer's bids a swap fills is a
+        fact about what the taker asked for, not about state -- exactly the
+        argument that made named fills necessary on the seller's side (D-082).
+
+        The guard is the buyer's own price: this swap must not have paid MORE
+        per token than the bid offered. A bid is a ceiling, and the remainder
+        keeps it.
+        """
+        since = self.params.bid_fills_from
+        if since is None or rtx.block_height < since or not named:
+            return []
+        if give.kind != I.LEG_TOKEN or take.kind != I.LEG_COINS:
+            return []                     # only tokens bought for coins
+        row = self.state.db.conn.execute(
+            "SELECT * FROM book_order WHERE txid=? AND address=? "
+            "AND sale_property=? AND want_property=?",
+            (named.hex(), buyer, self.COIN_PROPERTY, give.property_id)).fetchone()
+        if row is None:
+            return []
+        row = dict(row)
+        # take.amount/give.amount <= sale/want, without dividing anything.
+        if take.amount * row["want_amount"] > row["sale_amount"] * give.amount:
+            return []                     # dearer than the bid; leave it alone
+        taken = min(give.amount, row["want_amount"])
+        if taken <= 0:
+            return []
+        # Rounded UP, so what is left of the bid never offers more per token
+        # than the whole of it did. Rounding the other way would leave a
+        # remainder bidding dearer than the person ever said.
+        spent = -(-row["sale_amount"] * taken // row["want_amount"])
+        return [(row, taken, min(spent, row["sale_amount"]))]
+
+    def _reduce_bid(self, row: dict, taken: int, spent: int) -> None:
+        """Take what was bought out of a standing bid. Nothing else moves."""
+        left = row["want_amount"] - taken
+        if left <= 0:
+            self.state.delete("book_order", {"txid": row["txid"]})
+            return
+        self.state.update("book_order", {"txid": row["txid"]}, {
+            "want_amount": left,
+            "sale_amount": max(1, row["sale_amount"] - spent),
+        })
+
+    def _fill_order(self, row: dict, taken: int, want: int) -> None:
+        """Take `taken` out of an order's reserve and reduce the order by it."""
+        self._move_from_reserve(row["address"], row["sale_property"], taken,
+                                "metadex_reserve")
+        left = row["sale_amount"] - taken
+        if left <= 0:
+            self.state.delete("book_order", {"txid": row["txid"]})
+            # Remembered for the rest of this block (an Engine is made per
+            # block): a second take of it in the same block is a race, and it
+            # still knows the order's maker and price (`_take_order`).
+            self.__dict__.setdefault("_emptied", {})[row["txid"]] = dict(
+                row, sale_amount=row["sale_amount"], reserved=0)
+            return
+        self.state.update("book_order", {"txid": row["txid"]}, {
+            "sale_amount": left,
+            # max(1): the arithmetic cannot reach zero while `left` is
+            # positive, and an order wanting nothing would be a price of zero.
+            "want_amount": max(1, row["want_amount"] - want),
+            "reserved": row["reserved"] - taken,
+        })
+
+    def _check_leg(self, rtx: ArcadeTransaction, leg: I.Leg, giver: str,
+                   taker: str, extra: int = 0) -> None:
+        """`extra` is what a standing order of the giver's would release."""
+        if leg.kind == I.LEG_INSCRIPTION:
+            row = self.state.db.conn.execute(
+                "SELECT owner FROM inscription WHERE txid=?", (leg.txid.hex(),)).fetchone()
+            if row is None:
+                raise InvalidTransaction("no such inscription")
+            if row["owner"] != giver:
+                raise InvalidTransaction(f"inscription {leg.txid.hex()[:12]} is not {giver}'s to give")
+            return
+        if leg.kind == I.LEG_TOKEN:
+            if not 0 < leg.amount <= MAX_AMOUNT:
+                raise InvalidTransaction(f"amount {leg.amount} out of range")
+            prop = self.get_property(leg.property_id)
+            if prop is None:
+                raise InvalidTransaction(f"property {leg.property_id} does not exist")
+            if prop["property_type"] == PROPERTY_NONFUNGIBLE:
+                raise InvalidTransaction(f"property {leg.property_id} is non-fungible")
+            held = self.get_balance(giver, leg.property_id)["balance"] + extra
+            if held < leg.amount:
+                raise InvalidTransaction(
+                    f"insufficient balance: {giver} holds {held} of property "
+                    f"{leg.property_id}, needs {leg.amount}")
+            return
+        if leg.kind == I.LEG_COINS:
+            if leg.amount <= 0:
+                raise InvalidTransaction("a coin leg needs an amount")
+            paid = rtx.paid_to(taker)
+            if paid < leg.amount:
+                raise InvalidTransaction(
+                    f"{taker} is paid {paid} satoshis by this transaction, "
+                    f"the swap says {leg.amount}")
+            return
+        raise InvalidTransaction(f"unknown swap leg {leg.kind}")
+
+    def _move_leg(self, leg: I.Leg, giver: str, taker: str,
+                  rtx: ArcadeTransaction | None = None) -> None:
+        if leg.kind == I.LEG_INSCRIPTION:
+            self.state.update("inscription", {"txid": leg.txid.hex()}, {"owner": taker})
+            if rtx is not None:
+                # A swap is a hand it changed in as much as a transfer is.
+                # Provenance that counted only transfers would miss every
+                # piece that was ever bought.
+                self._note_move(rtx, leg.txid.hex(), giver, taker, "swap")
+        elif leg.kind == I.LEG_TOKEN:
+            self.debit(giver, leg.property_id, leg.amount)
+            self.credit(taker, leg.property_id, leg.amount)
+        # Coins moved when the transaction did; the ledger only checked.
+
+    # --- system messages ------------------------------------------------------
+
+    def _activate_feature(self, rtx: ArcadeTransaction, msg: P.ActivateFeature) -> None:
+        """Type 65534.
+
+        Arcade accepts activations only from a configured authority address. Omni
+        does the same (rules.cpp checks against a hard-coded list); allowing any
+        address to activate features would let anyone change consensus.
+        """
+        authority = getattr(self.params, "activation_authority", None)
+        if authority is not None and rtx.sender != authority:
+            raise InvalidTransaction(
+                f"{rtx.sender} is not the activation authority"
+            )
+        if msg.activation_block < rtx.block_height:
+            raise InvalidTransaction(
+                f"activation block {msg.activation_block} is in the past "
+                f"(current height {rtx.block_height})"
+            )
+
+        existing = self.state.db.conn.execute(
+            "SELECT 1 FROM activation WHERE feature_id = ?", (msg.feature_id,)
+        ).fetchone()
+        row = {
+            "feature_id": msg.feature_id,
+            "activation_block": msg.activation_block,
+            "min_client_version": msg.min_client_version,
+            "active": 1,
+        }
+        if existing:
+            self.state.update("activation", {"feature_id": msg.feature_id}, row)
+        else:
+            self.state.insert("activation", row)
+
+    def _deactivate_feature(self, rtx: ArcadeTransaction, msg: P.DeactivateFeature) -> None:
+        """Type 65533."""
+        authority = getattr(self.params, "activation_authority", None)
+        if authority is not None and rtx.sender != authority:
+            raise InvalidTransaction(f"{rtx.sender} is not the activation authority")
+
+        existing = self.state.db.conn.execute(
+            "SELECT 1 FROM activation WHERE feature_id = ?", (msg.feature_id,)
+        ).fetchone()
+        if not existing:
+            raise InvalidTransaction(f"feature {msg.feature_id} was never activated")
+        self.state.update("activation", {"feature_id": msg.feature_id}, {"active": 0})
+
+    def _alert(self, rtx: ArcadeTransaction, msg: P.Alert) -> None:
+        """Type 65535. Alerts carry no state; they are recorded in arcade_tx only."""
+        return None
